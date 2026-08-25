@@ -95,5 +95,15 @@
             <displayName>Fetch Directory Content</displayName>
             <description>Fetch file content in a folder in to list of base64 encoded stream.</description>
         </component>
+        <component name="streamRead" >
+            <file>streamRead.xml</file>
+            <displayName>Stream Read</displayName>
+            <description>Opens a file as the head of a stream pipeline. Only valid inside a streamPipeline.</description>
+        </component>
+        <component name="streamWrite" >
+            <file>streamWrite.xml</file>
+            <displayName>Stream Write</displayName>
+            <description>Writes a stream pipeline's output to a file. Only valid inside a streamPipeline.</description>
+        </component>
     </subComponents>
 </component>

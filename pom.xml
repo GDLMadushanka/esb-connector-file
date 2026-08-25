@@ -20,7 +20,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>org.wso2.integration.connector</groupId>
     <artifactId>mi-connector-file</artifactId>
-    <version>6.0.6-SNAPSHOT</version>
+    <version>6.0.7</version>
     <packaging>jar</packaging>
     <name>WSO2 Carbon - Connector For esb-connector-file</name>
     <url>http://wso2.org</url>
@@ -34,7 +34,7 @@
         <automation.framework.utils.version>4.4.2</automation.framework.utils.version>
         <automation.framework.version>4.4.3</automation.framework.version>
         <emma.version>2.1.5320</emma.version>
-        <synapse.version>4.0.0-wso2v215</synapse.version>
+        <synapse.version>4.1.0-wso2v68-SNAPSHOT</synapse.version>
         <carbon.mediation.version>4.7.183</carbon.mediation.version>
         <json.version>2.0.0.wso2v1</json.version>
         <org.testng.version>6.1.1</org.testng.version>
@@ -49,10 +49,17 @@
     </properties>
 
     <dependencies>
+        <!--
+          Provided: the server already carries synapse-core. A bundled copy would give these
+          operators a different StreamOperator class than the pipeline loads, so every instanceof
+          in StreamPipelineFactory would fail with "is not a stream operator" — an error that
+          points nowhere near the cause.
+        -->
         <dependency>
             <groupId>org.apache.synapse</groupId>
             <artifactId>synapse-core</artifactId>
             <version>${synapse.version}</version>
+            <scope>provided</scope>
         </dependency>
         <dependency>
             <groupId>org.apache.synapse</groupId>

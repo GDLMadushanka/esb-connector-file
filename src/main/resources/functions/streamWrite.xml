@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+   Copyright (c) 2026, WSO2 LLC. (http://www.wso2.org) All Rights Reserved.
+
+   WSO2 LLC. licenses this file to you under the Apache License,
+   Version 2.0 (the "License"); you may not use this file except
+   in compliance with the License.
+   You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing,
+   software distributed under the License is distributed on an
+   "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+   KIND, either express or implied. See the License for the
+   specific language governing permissions and limitations
+   under the License.
+  -->
+<!--
+  Only valid inside a <streamPipeline>. See streamRead.xml. The binding is held for the whole of
+  consume(), because everything upstream of a sink executes inside it.
+-->
+<template xmlns="http://ws.apache.org/ns/synapse" name="streamWrite">
+    <parameter name="path" description="Path to write to, relative to the connection's working directory"/>
+    <sequence>
+        <class name="org.wso2.carbon.connector.operations.StreamWrite"/>
+    </sequence>
+</template>
