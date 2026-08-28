@@ -143,6 +143,13 @@ public class Materialise extends AbstractConnector implements StreamTransform {
         private final Path partial;
         private OutputStream out;
 
+        /**
+         * Whether upstream reached end-of-stream. The artifact is only complete if it did, and nothing
+         * else can tell: this stage writes as a side effect of being read, so a downstream sink that
+         * stops early leaves a short file with no other symptom.
+         */
+        private boolean drained;
+
         private TeeStream(InputStream upstream, StreamContext ctx, Path artifact) {
             super(upstream);
             this.ctx = ctx;
@@ -154,7 +161,7 @@ public class Materialise extends AbstractConnector implements StreamTransform {
             if (out == null) {
                 out = Files.newOutputStream(partial);
                 ctx.resources().registerCommitting(ctx.stageName() + ":artifact",
-                        new RenameOnCommit(out, partial, artifact));
+                        new RenameOnCommit(out, partial, artifact, this));
             }
             return out;
         }
@@ -162,7 +169,9 @@ public class Materialise extends AbstractConnector implements StreamTransform {
         @Override
         public int read() throws IOException {
             int b = in.read();
-            if (b != -1) {
+            if (b == -1) {
+                drained = true;
+            } else {
                 out().write(b);
             }
             return b;
@@ -171,10 +180,16 @@ public class Materialise extends AbstractConnector implements StreamTransform {
         @Override
         public int read(byte[] b, int off, int len) throws IOException {
             int read = in.read(b, off, len);
-            if (read > 0) {
+            if (read == -1) {
+                drained = true;
+            } else if (read > 0) {
                 out().write(b, off, read);
             }
             return read;
+        }
+
+        boolean isDrained() {
+            return drained;
         }
 
         /**
@@ -188,22 +203,40 @@ public class Materialise extends AbstractConnector implements StreamTransform {
         }
     }
 
-    /** Publishes the artifact on success, discards it on failure. */
+    /**
+     * Publishes the artifact on success, discards it on failure — and treats "the run succeeded but
+     * upstream was never drained" as a failure for this artifact.
+     *
+     * <p>That last case is the one worth explaining. A sink is obliged to read to end-of-stream, but
+     * nothing enforces it, and this stage writes only as a side effect of being read. So a sink that
+     * returns early leaves a short file and a successful run — and renaming that into place would
+     * publish a truncated artifact under the name that means complete, which the next run would resume
+     * from and trust. Losing the artifact is recoverable; trusting a short one is not.
+     */
     private static final class RenameOnCommit implements StreamCommit {
 
         private final OutputStream out;
         private final Path partial;
         private final Path artifact;
+        private final TeeStream source;
 
-        private RenameOnCommit(OutputStream out, Path partial, Path artifact) {
+        private RenameOnCommit(OutputStream out, Path partial, Path artifact, TeeStream source) {
             this.out = out;
             this.partial = partial;
             this.artifact = artifact;
+            this.source = source;
         }
 
         @Override
         public void close() throws IOException {
             out.close();
+            if (!source.isDrained()) {
+                Files.deleteIfExists(partial);
+                throw new IOException("the chain above '" + artifact.getParent().getFileName()
+                        + "' was not read to end-of-stream, so its artifact is incomplete and has been"
+                        + " discarded. A sink must drain what it is given or throw; returning early"
+                        + " reports success on a partial transfer");
+            }
             Files.move(partial, artifact, StandardCopyOption.ATOMIC_MOVE,
                     StandardCopyOption.REPLACE_EXISTING);
         }
