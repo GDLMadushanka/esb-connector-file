@@ -21,6 +21,8 @@ package org.wso2.carbon.connector.operations;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.MessageContext;
+import org.apache.synapse.stream.Checkpoint;
+import org.apache.synapse.stream.CheckpointUnit;
 import org.apache.synapse.stream.StreamCommit;
 import org.apache.synapse.stream.StreamContext;
 import org.apache.synapse.stream.StreamException;
@@ -28,12 +30,15 @@ import org.apache.synapse.stream.StreamTransform;
 import org.wso2.integration.connector.core.AbstractConnector;
 import org.wso2.integration.connector.core.ConnectException;
 
+import java.io.FileOutputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.StandardCopyOption;
 
 /**
@@ -76,6 +81,9 @@ public class Materialise extends AbstractConnector implements StreamTransform {
     /** Suffix of the file being written. A partial artifact must never be visible under its final name. */
     private static final String PARTIAL = ".part";
 
+    /** Stored with every checkpoint so a later version can refuse one it cannot interpret. */
+    private static final String FORMAT_VERSION = "materialise-bytes-1";
+
     @Override
     public void connect(MessageContext messageContext) throws ConnectException {
         throw new ConnectException(NAME + " is only valid inside a <streamPipeline>. It contributes a"
@@ -107,6 +115,19 @@ public class Materialise extends AbstractConnector implements StreamTransform {
         return true;
     }
 
+    /**
+     * Records how far it got, so a failure resumes mid-artifact rather than re-running the segment.
+     *
+     * <p>Declaring this means the pipeline is refused at deployment unless a checkpoint store is
+     * available, which needs the MFT datasource. That is the gate working: an operator that says it
+     * keeps a durable position, running without one, would report success on a transfer that could
+     * never resume.
+     */
+    @Override
+    public boolean checkpointed() {
+        return true;
+    }
+
     @Override
     public InputStream wrap(InputStream upstream, StreamContext ctx) throws StreamException {
         Path artifact = ctx.artifact();
@@ -125,7 +146,8 @@ public class Materialise extends AbstractConnector implements StreamTransform {
             }
         }
 
-        // No I/O yet: opening the partial file is deferred to the first read, like any other operator.
+        // No I/O yet: reading the checkpoint and opening the partial file are both deferred to the
+        // first read, like any other operator.
         return new TeeStream(upstream, ctx, artifact);
     }
 
@@ -141,13 +163,15 @@ public class Materialise extends AbstractConnector implements StreamTransform {
         private final StreamContext ctx;
         private final Path artifact;
         private final Path partial;
-        private OutputStream out;
 
-        /**
-         * Whether upstream reached end-of-stream. The artifact is only complete if it did, and nothing
-         * else can tell: this stage writes as a side effect of being read, so a downstream sink that
-         * stops early leaves a short file with no other symptom.
-         */
+        /** Bytes durably in the partial file and recorded in the checkpoint. */
+        private long checkpointed;
+
+        /** Bytes written since the last checkpoint. Bounded by the deployer's maxReprocessed. */
+        private long sinceCheckpoint;
+
+        private FileOutputStream out;
+        private boolean started;
         private boolean drained;
 
         private TeeStream(InputStream upstream, StreamContext ctx, Path artifact) {
@@ -157,33 +181,138 @@ public class Materialise extends AbstractConnector implements StreamTransform {
             this.partial = artifact.resolveSibling(artifact.getFileName() + PARTIAL);
         }
 
-        private OutputStream out() throws IOException {
-            if (out == null) {
-                out = Files.newOutputStream(partial);
-                ctx.resources().registerCommitting(ctx.stageName() + ":artifact",
-                        new RenameOnCommit(out, partial, artifact, this));
+        /**
+         * Picks up where a previous attempt stopped, then opens the partial file to append.
+         *
+         * <h2>L &le; A</h2>
+         * The checkpoint records a length {@code L}. The partial file has an actual length {@code A}.
+         * Resume takes the checkpoint only if {@code L <= A}: a checkpoint ahead of the file describes
+         * bytes that are not there, so it is discarded and this starts over. It should not happen —
+         * every recorded length was flushed before the checkpoint advanced — but the check is cheap and
+         * the failure it prevents is resuming on top of bytes that were never written.
+         *
+         * <p>Note what {@code L <= A} does not verify: that the first {@code L} bytes are the <i>right</i>
+         * bytes. Length is not content. Detecting a torn write below the recorded length would need a
+         * checksum, which is not here.
+         */
+        private void start() throws IOException {
+            started = true;
+
+            long resumeAt = 0L;
+            Checkpoint last = ctx.checkpointStore().lastComplete();
+            if (last != null) {
+                long actual = Files.exists(partial) ? Files.size(partial) : 0L;
+                if (last.outputLength() <= actual) {
+                    resumeAt = last.outputLength();
+                } else {
+                    log.warn(NAME + " stage '" + ctx.stageName() + "' has a checkpoint at "
+                            + last.outputLength() + " bytes but its partial file is only " + actual
+                            + "; the checkpoint is ahead of the data, so it is being discarded and this"
+                            + " stage restarts");
+                }
             }
-            return out;
+
+            if (resumeAt > 0L) {
+                // Cut anything written after the checkpoint. Those bytes were never recorded, so
+                // whatever produced them is about to produce them again.
+                try (FileChannel truncate = FileChannel.open(partial, StandardOpenOption.WRITE)) {
+                    truncate.truncate(resumeAt);
+                }
+                skipUpstream(resumeAt);
+                log.info(NAME + " stage '" + ctx.stageName() + "' resumed at " + resumeAt
+                        + " bytes from its checkpoint");
+            } else if (Files.exists(partial)) {
+                Files.delete(partial);
+            }
+
+            checkpointed = resumeAt;
+            out = new FileOutputStream(partial.toFile(), resumeAt > 0L);
+            ctx.resources().registerCommitting(ctx.stageName() + ":artifact",
+                    new RenameOnCommit(out, partial, artifact, this));
+        }
+
+        /**
+         * Discards the prefix this run has already written.
+         *
+         * <p>Sound only because everything above is deterministic: the same source re-read must produce
+         * the same bytes, or this skips past different data and the artifact is silently wrong. That is
+         * what {@code deterministic()} is for, and why a wrong {@code true} corrupts rather than errors.
+         */
+        private void skipUpstream(long count) throws IOException {
+            long remaining = count;
+            byte[] scratch = new byte[8192];
+            while (remaining > 0) {
+                long skipped = in.skip(remaining);
+                if (skipped > 0) {
+                    remaining -= skipped;
+                    continue;
+                }
+                int read = in.read(scratch, 0, (int) Math.min(scratch.length, remaining));
+                if (read == -1) {
+                    throw new IOException("cannot resume at " + count + " bytes: the source ended after "
+                            + (count - remaining) + ". It is shorter than it was, so the prefix already"
+                            + " written no longer matches it");
+                }
+                remaining -= read;
+            }
+        }
+
+        /**
+         * The ordering contract, and it is unreorderable.
+         *
+         * <ol>
+         *   <li>write the bytes</li>
+         *   <li>make them durable — {@code fsync}</li>
+         *   <li>advance the checkpoint</li>
+         * </ol>
+         *
+         * <p>A checkpoint ahead of its effect is silent data loss: resume would skip past bytes that
+         * were never written. A checkpoint behind it costs re-doing work, bounded by
+         * {@code maxReprocessed}. Only one of those is acceptable, which is why the order is not a
+         * performance decision — and why the flush is inside the bound rather than per byte.
+         */
+        private void recordIfDue() throws IOException {
+            if (sinceCheckpoint < ctx.maxReprocessed()) {
+                return;
+            }
+            out.flush();
+            out.getFD().sync();                                     // 2. durable before the position moves
+            checkpointed += sinceCheckpoint;
+            sinceCheckpoint = 0L;
+            ctx.checkpointStore().append(new Checkpoint(               // 3. and only then
+                    checkpointed, checkpointed, CheckpointUnit.BYTES, FORMAT_VERSION));
         }
 
         @Override
         public int read() throws IOException {
+            if (!started) {
+                start();
+            }
             int b = in.read();
             if (b == -1) {
                 drained = true;
-            } else {
-                out().write(b);
+                return -1;
             }
+            out.write(b);                                            // 1.
+            sinceCheckpoint++;
+            recordIfDue();
             return b;
         }
 
         @Override
         public int read(byte[] b, int off, int len) throws IOException {
+            if (!started) {
+                start();
+            }
             int read = in.read(b, off, len);
             if (read == -1) {
                 drained = true;
-            } else if (read > 0) {
-                out().write(b, off, read);
+                return -1;
+            }
+            if (read > 0) {
+                out.write(b, off, read);                             // 1.
+                sinceCheckpoint += read;
+                recordIfDue();
             }
             return read;
         }
@@ -215,12 +344,12 @@ public class Materialise extends AbstractConnector implements StreamTransform {
      */
     private static final class RenameOnCommit implements StreamCommit {
 
-        private final OutputStream out;
+        private final FileOutputStream out;
         private final Path partial;
         private final Path artifact;
         private final TeeStream source;
 
-        private RenameOnCommit(OutputStream out, Path partial, Path artifact, TeeStream source) {
+        private RenameOnCommit(FileOutputStream out, Path partial, Path artifact, TeeStream source) {
             this.out = out;
             this.partial = partial;
             this.artifact = artifact;
