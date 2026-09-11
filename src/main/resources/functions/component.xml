@@ -105,10 +105,5 @@
             <displayName>Stream Write</displayName>
             <description>Writes a stream pipeline's output to a file. Only valid inside a streamPipeline.</description>
         </component>
-        <component name="materialise" >
-            <file>materialise.xml</file>
-            <displayName>Materialise</displayName>
-            <description>TEMPORARY. Writes what passes through to a durable artifact and passes it on unchanged. Only valid inside a streamPipeline.</description>
-        </component>
     </subComponents>
 </component>
