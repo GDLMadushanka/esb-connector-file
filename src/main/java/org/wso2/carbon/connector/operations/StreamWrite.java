@@ -18,8 +18,13 @@
 
 package org.wso2.carbon.connector.operations;
 
+import org.wso2.org.apache.commons.vfs2.FileSystemException;
+import org.wso2.org.apache.commons.vfs2.RandomAccessContent;
+import org.wso2.org.apache.commons.vfs2.util.RandomAccessMode;
 import org.apache.synapse.MessageContext;
 import org.apache.synapse.stream.StreamCommit;
+import org.apache.synapse.stream.CheckpointUnit;
+import org.apache.synapse.stream.StageArtifact;
 import org.apache.synapse.stream.StreamContext;
 import org.apache.synapse.stream.StreamException;
 import org.apache.synapse.stream.StreamSink;
@@ -57,12 +62,73 @@ import java.io.OutputStream;
  */
 public class StreamWrite extends AbstractConnector implements StreamSink {
 
+    /**
+     * Keeps a resume position, in bytes, and writes no artifact of its own.
+     *
+     * <p>Legal because a sink is always last: a position that outlives a failure is only dangerous
+     * when something downstream has already been handed output it will not be handed again, and
+     * nothing is downstream of a sink.
+     *
+     * <p>Without this a download could not resume at all. {@code hasDurableState()} is true only when
+     * some stage declares {@code checkpointed()} or {@code materialises()}, so a chain of
+     * {@code blobStreamRead -> file.streamWrite} had no durable state, was therefore not resumable,
+     * and — because only a resumable run stops on shutdown (ADR-0037) — could not be stopped either.
+     * Killing a 500 GB download at 450 started it again from zero.
+     */
+    @Override
+    public boolean checkpointed() {
+        return true;
+    }
+
+    /**
+     * Where this sink will resume, in bytes, so the framework can start a seekable source there.
+     *
+     * <p>Trivial here because the checkpoint is already counted in bytes — a sink that records blocks
+     * or records would have to convert. Returns the <b>reconciled</b> position, not the raw
+     * checkpoint: see {@link #resumeAt}.
+     */
+    @Override
+    public long durableByteOffset(StreamContext ctx) throws IOException {
+        try {
+            Resolved resolved = resolve(ctx);
+            return resumeAt(ctx.artifact(CheckpointUnit.BYTES, FORMAT_VERSION), resolved.part, false);
+        } catch (StreamException cannotSay) {
+            return -1L;
+        }
+    }
+
+
     private static final String NAME = "file.streamWrite";
 
     private static final int BUFFER_BYTES = 64 * 1024;
 
-    /** How often to report progress and check for cancellation, in bytes. */
-    private static final long CHECK_INTERVAL_BYTES = 8L * 1024 * 1024;
+    /**
+     * How often to report cumulative progress to the job, in bytes.
+     *
+     * <p>Coarse on purpose. {@code JobContext.progress} is a database update behind a live view and its
+     * contract says callers must rate-limit, so this is a display cadence and nothing else.
+     */
+    private static final long PROGRESS_INTERVAL_BYTES = 8L * 1024 * 1024;
+
+    /**
+     * How often to offer the framework a position, in bytes.
+     *
+     * <p><b>Not the checkpoint cadence.</b> {@code unitDone} is a report; the framework decides whether
+     * a checkpoint is due from the deployer's {@code checkpointEvery}, so reporting more finely than
+     * that costs only the {@code flush()} below and never an extra fsync. What this number does set is
+     * the <b>floor</b> on what a deployer can ask for: no {@code checkpointEvery} finer than this can
+     * be honoured, which is why it is well below the default rather than equal to it.
+     *
+     * <p>1 MiB rather than the 64 KiB buffer because the flush is the cost, and over SFTP or SMB it may
+     * be a round trip rather than a push into the page cache.
+     */
+    private static final long CHECKPOINT_REPORT_BYTES = 1024L * 1024;
+
+    /**
+     * Versions the meaning of this stage's checkpoint. The position is a byte count into the part
+     * file, which is also the byte count consumed from upstream — this sink changes no volume.
+     */
+    private static final String FORMAT_VERSION = "file-bytes-1";
 
     @Override
     public void connect(MessageContext messageContext) throws ConnectException {
@@ -79,11 +145,104 @@ public class StreamWrite extends AbstractConnector implements StreamSink {
     @Override
     public void consume(InputStream upstream, StreamContext ctx) throws StreamException, IOException {
 
+        Resolved resolved = resolve(ctx);
+        FileObject target = resolved.target;
+        FileObject part = resolved.part;
+        String path = resolved.path;
+
+        ctx.resources().register(NAME + ":target", target::close);
+        ctx.resources().register(NAME + ":part", part::close);
+
+        StageArtifact checkpoint = ctx.artifact(CheckpointUnit.BYTES, FORMAT_VERSION);
+        long resumeFrom = resumeAt(checkpoint, part, true);
+
+        // Skip only what the source did not already skip. Both ends read upstreamStartsAt(), so this
+        // is zero when the framework started a seekable source at our resume point, and the whole
+        // prefix when it could not — the old behaviour, still correct, just slower.
+        long discard = resumeFrom - ctx.upstreamStartsAt();
+        if (discard > 0) {
+            skip(upstream, discard, path);
+            log.info(NAME + " resuming '" + path + "' at byte " + resumeFrom + "; re-read and"
+                    + " discarded " + discard + " bytes the source could not skip itself");
+        } else if (resumeFrom > 0) {
+            log.info(NAME + " resuming '" + path + "' at byte " + resumeFrom
+                    + "; the source started there, so nothing is re-read");
+        }
+
+        // Append when resuming. The part file already holds every byte below resumeFrom, truncated to
+        // exactly that length above.
+        OutputStream out = part.getContent().getOutputStream(resumeFrom > 0);
+
+        // Registered as committing, so the run's outcome decides whether this is published. A close
+        // failure also fails the transfer: every byte may have been read, but the destination is not in
+        // the state the caller was told it would be.
+        ctx.resources().registerCommitting(NAME + ":commit", new RenameOnCommit(out, part, target));
+
+        byte[] buffer = new byte[BUFFER_BYTES];
+        long written = resumeFrom;
+        long sinceProgress = 0L;
+        long sinceReport = 0L;
+        int read;
+
+        while ((read = upstream.read(buffer)) != -1) {
+            out.write(buffer, 0, read);
+            written += read;
+            sinceProgress += read;
+            sinceReport += read;
+
+            if (sinceProgress >= PROGRESS_INTERVAL_BYTES) {
+                sinceProgress = 0L;
+                // Records are not knowable here: a sink sees a byte chain, not a structure.
+                ctx.job().progress(ctx.stageName(), written, 0L);
+            }
+
+            if (sinceReport >= CHECKPOINT_REPORT_BYTES) {
+                sinceReport = 0L;
+
+                // The ordering contract, and the operator's half of it: the bytes are pushed out
+                // before the position moves. flush() is not fsync — VFS exposes no sync, and over
+                // SFTP or SMB there is nothing local to sync — so a machine crash can still leave the
+                // checkpoint ahead of what survived. That is what the reconciliation in resumeAt is
+                // for, and it is weaker than the framework's own artifact handling, which does fsync.
+                // A process kill, which is what a resume test does, is fully covered: the page cache
+                // outlives the process.
+                out.flush();
+                checkpoint.unitDone(written);
+            }
+
+            // Checked every buffer, NOT every checkpoint interval. These were one branch, which tied
+            // how often a stop is noticed to how often the position advances -- so a sink that had not
+            // yet reached 8 MiB could not be stopped at all. During a graceful shutdown of a transfer
+            // over a slow link that is the normal case, not an edge one: the run that exposed this had
+            // written nothing, and the stop was seen 96s after it was asked for, at the first interval.
+            // Reading a volatile flag per 64 KiB buffer costs nothing worth measuring.
+            if (ctx.job().isCancelled()) {
+                throw new StreamException("transfer to '" + path + "' was cancelled after "
+                        + written + " bytes", false);
+            }
+        }
+
+        ctx.job().progress(ctx.stageName(), written, 0L);
+    }
+
+    /** Where the target and its part file live, resolved once and reused. */
+    private static final class Resolved {
+        private final FileObject target;
+        private final FileObject part;
+        private final String path;
+
+        private Resolved(FileObject target, FileObject part, String path) {
+            this.target = target;
+            this.part = part;
+            this.path = path;
+        }
+    }
+
+    private Resolved resolve(StreamContext ctx) throws StreamException {
         MessageContext msg = ctx.message();
         if (msg == null) {
             throw new StreamException(NAME + " needs the invoking message to read its parameters from");
         }
-
         String connection;
         try {
             connection = Utils.getConnectionName(msg);
@@ -96,58 +255,87 @@ public class StreamWrite extends AbstractConnector implements StreamSink {
         if (path == null || path.isEmpty()) {
             throw new StreamException(NAME + " requires a <path> parameter");
         }
-
-        FileObject target;
-        FileObject part;
         try {
             FileSystemHandler handler = Utils.getFileSystemHandler(connection);
             String base = handler.getBaseDirectoryPath();
-            target = handler.resolveFileWithSuspension(base + path);
-            part = handler.resolveFileWithSuspension(base + path + ".part");
+            FileObject target = handler.resolveFileWithSuspension(base + path);
+            FileObject part = handler.resolveFileWithSuspension(base + path + ".part");
             FileObject parent = target.getParent();
             if (parent != null && !parent.exists()) {
                 parent.createFolder();
             }
+            return new Resolved(target, part, path);
         } catch (Exception e) {
             throw new StreamException("cannot open target '" + path + "' on connection '"
                     + connection + "'", e, true);
         }
+    }
 
-        ctx.resources().register(NAME + ":target", target::close);
-        ctx.resources().register(NAME + ":part", part::close);
-
-        OutputStream out = part.getContent().getOutputStream();
-
-        // Registered as committing, so the run's outcome decides whether this is published. A close
-        // failure also fails the transfer: every byte may have been read, but the destination is not in
-        // the state the caller was told it would be.
-        ctx.resources().registerCommitting(NAME + ":commit", new RenameOnCommit(out, part, target));
-
-        byte[] buffer = new byte[BUFFER_BYTES];
-        long written = 0L;
-        long sinceCheck = 0L;
-        int read;
-
-        while ((read = upstream.read(buffer)) != -1) {
-            out.write(buffer, 0, read);
-            written += read;
-            sinceCheck += read;
-
-            if (sinceCheck >= CHECK_INTERVAL_BYTES) {
-                sinceCheck = 0L;
-                // Records are not knowable here: a sink sees a byte chain, not a structure.
-                ctx.job().progress(ctx.stageName(), written, 0L);
-
-                // Cooperative, and checked between buffers rather than per byte, so a stop lands on a
-                // boundary this writer chose. A cancelled run aborts, so the part file is discarded.
-                if (ctx.job().isCancelled()) {
-                    throw new StreamException("transfer to '" + path + "' was cancelled after "
-                            + written + " bytes", false);
-                }
-            }
+    /**
+     * The byte this attempt resumes at, reconciled against what is actually on disk.
+     *
+     * <p>This is the {@code L <= A} rule the framework applies to its own artifacts, done here because
+     * the part file is this operator's, not the framework's. {@code L} is the length the checkpoint
+     * claims; {@code A} is what the part file really holds.
+     *
+     * <ul>
+     *   <li><b>L &lt;= A</b> — the ordinary case. Accept the checkpoint and cut the file back to it:
+     *       the bytes above were written but never recorded, so whatever produced them is about to
+     *       produce them again, and leaving them would duplicate a stretch of the output.</li>
+     *   <li><b>L &gt; A</b> — the checkpoint describes bytes that are not there, which only storage
+     *       that acknowledged a write it did not keep can produce. The file wins; resume from A.</li>
+     * </ul>
+     *
+     * <p>Its limit, stated plainly because it is the same one the framework documents: this compares
+     * <i>lengths</i>. A file of the right length with an unwritten gap below it passes, and only a
+     * checksum would catch that. {@code checkpointEvery} bounds how much such a gap could cost —
+     * this stage counts in bytes, so that is its cadence attribute and not {@code maxReprocessed},
+     * which would be a count of units here and is ignored (ADR-0056).
+     *
+     * @param truncate false to answer without touching the file, for {@code durableByteOffset}
+     */
+    private long resumeAt(StageArtifact checkpoint, FileObject part, boolean truncate)
+            throws IOException {
+        long claimed = checkpoint.resumePosition();
+        if (claimed <= 0) {
+            return 0L;
         }
+        long actual;
+        try {
+            actual = part.exists() ? part.getContent().getSize() : 0L;
+        } catch (FileSystemException unreadable) {
+            throw new IOException("cannot size the part file to resume against", unreadable);
+        }
+        if (claimed > actual) {
+            log.warn(NAME + " checkpoint claims " + claimed + " bytes but the part file holds "
+                    + actual + "; the checkpoint is ahead of the data, so resuming at " + actual);
+            return actual;
+        }
+        if (truncate && actual > claimed) {
+            try (RandomAccessContent raf =
+                         part.getContent().getRandomAccessContent(RandomAccessMode.READWRITE)) {
+                raf.setLength(claimed);
+            }
+            log.info(NAME + " cut the part file from " + actual + " back to the recorded " + claimed
+                    + " bytes; everything above was written but never checkpointed");
+        }
+        return claimed;
+    }
 
-        ctx.job().progress(ctx.stageName(), written, 0L);
+    /** Discards a prefix the source could not skip itself. */
+    private static void skip(InputStream upstream, long bytes, String path) throws IOException {
+        byte[] sink = new byte[BUFFER_BYTES];
+        long done = 0L;
+        while (done < bytes) {
+            int want = (int) Math.min(sink.length, bytes - done);
+            int read = upstream.read(sink, 0, want);
+            if (read < 0) {
+                throw new IOException(NAME + " resuming '" + path + "' needed to discard " + bytes
+                        + " bytes but the source ended after " + done
+                        + "; it is not the source the previous attempt read");
+            }
+            done += read;
+        }
     }
 
     /**

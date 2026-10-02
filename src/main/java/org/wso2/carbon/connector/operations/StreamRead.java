@@ -21,6 +21,7 @@ package org.wso2.carbon.connector.operations;
 import org.apache.synapse.MessageContext;
 import org.apache.synapse.stream.StreamContext;
 import org.apache.synapse.stream.StreamException;
+import org.apache.synapse.stream.SourceIdentity;
 import org.apache.synapse.stream.StreamOrigin;
 import org.apache.synapse.stream.StreamSource;
 import org.wso2.carbon.connector.connection.FileSystemHandler;
@@ -125,6 +126,76 @@ public class StreamRead extends AbstractConnector implements StreamSource {
         long offset = longParam(msg, "offset");
 
         return new LazyFileStream(ctx, connection, path.trim(), offset);
+    }
+
+    /**
+     * One stat, and the identity built from what it returns.
+     *
+     * <p>Unlike {@link #open}, I/O is expected here: this is how a queued transfer -- which carries no
+     * seed -- learns what it is about to read, early enough for the framework to notice that a previous
+     * attempt read something else.
+     *
+     * <p><b>The identity is the connection name, the configured path, the size and the modification
+     * time -- never a resolved URI.</b> {@code constructVfsUrl} embeds {@code username:password@} in
+     * the base path, and this value is written into a job row on a shared mount and printed whenever a
+     * guard mismatch is logged. Size and mtime are folded in deliberately: a file replaced between two
+     * attempts is a different source even at the same path, and the framework compares identities for
+     * equality only, so anything it should notice has to be inside the string.
+     *
+     * @return what this source would open, or {@code null} if the message is not available
+     * @throws StreamException retryable if the file cannot be reached or is not there yet -- for a
+     *                         queued transfer it may well arrive before the next attempt
+     */
+    @Override
+    public SourceIdentity identify(StreamContext ctx) throws StreamException {
+
+        MessageContext msg = ctx.message();
+        if (msg == null) {
+            return null;
+        }
+        String connection;
+        try {
+            connection = Utils.getConnectionName(msg);
+        } catch (InvalidConfigurationException e) {
+            // open() reports this properly a moment later, naming the stage; a probe that threw here
+            // would pre-empt it with a worse message.
+            return null;
+        }
+        String path = param(msg, "path");
+        if (path == null || path.trim().isEmpty()) {
+            return null;
+        }
+        String target = path.trim();
+
+        FileObject file = null;
+        try {
+            FileSystemHandler handler = Utils.getFileSystemHandler(connection);
+            file = handler.resolveFileWithSuspension(handler.getBaseDirectoryPath() + target);
+            if (!file.exists()) {
+                throw new StreamException(NAME + " cannot find '" + target + "' on connection '"
+                        + connection + "'", true);
+            }
+            long size = file.getContent().getSize();
+            long lastModified = file.getContent().getLastModifiedTime();
+            return new SourceIdentity(connection + "|" + target + "|" + size + "|" + lastModified,
+                    size, lastModified);
+        } catch (StreamException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new StreamException(NAME + " could not identify '" + target + "' on connection '"
+                    + connection + "'", e, true);
+        } finally {
+            // Closed here, not registered with the scope: this file handle belongs to the probe, and
+            // the run will resolve its own when it opens the stream.
+            if (file != null) {
+                try {
+                    file.close();
+                } catch (Exception ignore) {
+                    // A handle that will not close is not a reason to fail a transfer that has not
+                    // started; the connection pool reclaims it.
+                }
+            }
+        }
     }
 
     private static String param(MessageContext msg, String name) {
