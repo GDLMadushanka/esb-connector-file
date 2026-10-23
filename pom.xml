@@ -52,7 +52,7 @@
         <!--
           Provided: the server already carries synapse-core. A bundled copy would give these
           operators a different StreamOperator class than the pipeline loads, so every instanceof
-          in StreamPipelineFactory would fail with "is not a stream operator" — an error that
+          in StreamSequenceFactory would fail with "is not a stream operator" — an error that
           points nowhere near the cause.
         -->
         <dependency>

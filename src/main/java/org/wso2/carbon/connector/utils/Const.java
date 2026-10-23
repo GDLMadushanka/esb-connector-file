@@ -135,4 +135,6 @@ public final class Const {
 
     // SFTP-specific parameters  
     public static final String SFTP_PATH_FROM_ROOT = "sftpPathFromRoot";
+    public static final String SFTP_DISABLE_DETECT_EXEC_CHANNEL = "disableDetectExecChannel";
+    public static final String SMB2_SCHEME = "smb2";
 }

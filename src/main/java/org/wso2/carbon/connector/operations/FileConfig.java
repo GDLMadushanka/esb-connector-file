@@ -355,6 +355,8 @@ public class FileConfig extends AbstractConnectorOperation implements ManagedLif
                 lookupTemplateParamater(msgContext, Const.SET_AVOID_PERMISSION);
         String sftpPathFromRoot = (String) ConnectorUtils.
                 lookupTemplateParamater(msgContext, Const.SFTP_PATH_FROM_ROOT);
+        String disableDetectExecChannel = (String) ConnectorUtils.
+                lookupTemplateParamater(msgContext, Const.SFTP_DISABLE_DETECT_EXEC_CHANNEL);
 
         config.setConnectionTimeout(sftpConnectionTimeout);
         config.setSessionTimeout(sftpSessionTimeout);
@@ -363,6 +365,7 @@ public class FileConfig extends AbstractConnectorOperation implements ManagedLif
         config.setPrivateKeyPassword(privateKeyPassword);
         config.setAvoidPermissionCheck(setAvoidPermission);
         config.setSftpPathFromRoot(sftpPathFromRoot);
+        config.setDisableDetectExecChannel(disableDetectExecChannel);
     }
 
     /**

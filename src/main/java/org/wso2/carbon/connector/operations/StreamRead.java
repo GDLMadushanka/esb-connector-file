@@ -18,6 +18,8 @@
 
 package org.wso2.carbon.connector.operations;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.MessageContext;
 import org.apache.synapse.stream.StreamContext;
 import org.apache.synapse.stream.StreamException;
@@ -31,12 +33,16 @@ import org.wso2.integration.connector.core.AbstractConnector;
 import org.wso2.integration.connector.core.ConnectException;
 import org.wso2.integration.connector.core.util.ConnectorUtils;
 import org.wso2.org.apache.commons.vfs2.FileObject;
+import org.wso2.org.apache.commons.vfs2.RandomAccessContent;
+import org.wso2.org.apache.commons.vfs2.util.RandomAccessMode;
 
+import java.io.Closeable;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 
 /**
- * Opens a file as the head of a stream pipeline.
+ * Opens a file as the head of a stream sequence.
  *
  * <pre>
  *   &lt;file.streamRead configKey="conn1"&gt;
@@ -53,30 +59,48 @@ import java.io.InputStream;
  * There is nothing special about how this is packaged: a template in {@code functions/}, a
  * {@code <class>} mediator, parameters read off the message. The only difference from
  * {@code file.read} is that it implements {@link StreamSource} as well as being a mediator, which is
- * what lets a {@code <streamPipeline>} drive it directly instead of mediating it.
+ * what lets a {@code <streamSequence>} drive it directly instead of mediating it.
  *
  * <h2>Why no configuration is held in fields</h2>
- * One template instance is shared by every pipeline and every concurrent run that uses this operation,
+ * One template instance is shared by every sequence and every concurrent run that uses this operation,
  * so anything stored in a field would be overwritten by whichever transfer configured itself last.
  * Parameters are read from the message on each call and captured into locals instead.
  *
- * <p>They are also only bound <b>for the duration of {@link #open}</b> — the pipeline pushes the
+ * <p>They are also only bound <b>for the duration of {@link #open}</b> — the sequence pushes the
  * template's context before the call and pops it after. So everything needed later must be captured
  * here; the stream returned is read long afterwards, when nothing is bound.
  *
  * <h2>No I/O in open()</h2>
- * The pipeline builds every operator before a byte moves, and a resumed run discards the chain belonging
+ * The sequence builds every operator before a byte moves, and a resumed run discards the chain belonging
  * to segments it is skipping — so an eager connect would hold a remote handle, unused, for the whole
  * run. The connection lookup, the resolve, the existence check and the stat are all deferred to the
  * first {@code read()}.
+ *
+ * <h2>A dropped connection does not end the transfer</h2>
+ * The stream handed back is wrapped in a {@link ResumableInputStream}: when the connection goes, the
+ * file is opened again at the byte the read had reached and the transfer continues. See
+ * {@code readRetries} and {@code readRetryDelay}, and {@link FileOpener} for how a resume reaches byte
+ * N — by seeking where the provider allows it, and by skipping where it does not.
  */
 public class StreamRead extends AbstractConnector implements StreamSource {
 
     private static final String NAME = "file.streamRead";
 
+    /**
+     * Consecutive read failures without progress tolerated before the transfer fails.
+     *
+     * <p>On by default rather than opt-in: a transfer long enough to be worth streaming is long enough
+     * to meet a connection drop, and failing the whole run over one is the expensive answer — the
+     * framework's own retry would re-read everything already sent.
+     */
+    private static final long DEFAULT_READ_RETRIES = 3L;
+
+    /** Pause before a retry, multiplied by the failure count — so 5s, then 10s, then 15s. */
+    private static final long DEFAULT_READ_RETRY_DELAY_MS = 5000L;
+
     @Override
     public void connect(MessageContext messageContext) throws ConnectException {
-        throw new ConnectException(NAME + " is only valid inside a <streamPipeline>. It contributes a"
+        throw new ConnectException(NAME + " is only valid inside a <streamSequence>. It contributes a"
                 + " link to a lazy chain rather than mediating a message, so there is nothing for it to"
                 + " do in a sequence. Use file.read instead.");
     }
@@ -102,6 +126,27 @@ public class StreamRead extends AbstractConnector implements StreamSource {
         return StreamOrigin.REOPENABLE;
     }
 
+    /**
+     * Yes — the first byte delivered is the byte at {@link StreamContext#upstreamStartsAt()}, always.
+     *
+     * <p>What the promise is <b>not</b> is a promise that getting there is cheap. SFTP and local files
+     * expose random access, and a resume at byte 450,000,000 is then a single positioned open that
+     * never transfers the prefix. A provider without random access is skipped to instead, and what
+     * that costs is its own business: SMB2 skips by moving a read offset and arrives as cheaply as a
+     * seek, while another provider may read and discard the whole prefix. Either way the offset is
+     * honoured, and no route is worse than not declaring the flag — the sink would otherwise have
+     * read and discarded the same bytes one stage further along.
+     *
+     * <p>Declaring it is still worth it for the half where it is cheap, and the contract it has to keep
+     * is the one that matters: deliver from that byte, or fail. {@link FileOpener#skipTo} throws rather
+     * than returning short, because a source that quietly starts in the wrong place produces a
+     * destination missing a slice from its middle with nothing anywhere to notice.
+     */
+    @Override
+    public boolean seekable() {
+        return true;
+    }
+
     @Override
     public InputStream open(StreamContext ctx) throws StreamException {
 
@@ -111,7 +156,7 @@ public class StreamRead extends AbstractConnector implements StreamSource {
         }
 
         // Captured now, while the template's parameters are still bound. Tenant-qualified here too: the
-        // tenant is a property of the message, and one deployed pipeline serves every tenant.
+        // tenant is a property of the message, and one deployed sequence serves every tenant.
         String connection;
         try {
             connection = Utils.getConnectionName(msg);
@@ -123,9 +168,12 @@ public class StreamRead extends AbstractConnector implements StreamSource {
         if (path == null || path.trim().isEmpty()) {
             throw new StreamException(NAME + " requires a <path> parameter");
         }
-        long offset = longParam(msg, "offset");
+        long offset = longParam(msg, "offset", 0L);
+        long retries = longParam(msg, "readRetries", DEFAULT_READ_RETRIES);
+        long retryDelay = longParam(msg, "readRetryDelay", DEFAULT_READ_RETRY_DELAY_MS);
 
-        return new LazyFileStream(ctx, connection, path.trim(), offset);
+        return new LazyFileStream(ctx, connection, path.trim(), offset,
+                (int) Math.min(retries, Integer.MAX_VALUE), retryDelay);
     }
 
     /**
@@ -203,10 +251,11 @@ public class StreamRead extends AbstractConnector implements StreamSource {
         return value == null ? null : value.toString();
     }
 
-    private static long longParam(MessageContext msg, String name) throws StreamException {
+    private static long longParam(MessageContext msg, String name, long fallback)
+            throws StreamException {
         String value = param(msg, name);
         if (value == null || value.trim().isEmpty()) {
-            return 0L;
+            return fallback;
         }
         try {
             long parsed = Long.parseLong(value.trim());
@@ -234,53 +283,37 @@ public class StreamRead extends AbstractConnector implements StreamSource {
         private final String connection;
         private final String path;
         private final long offset;
+        private final int retries;
+        private final long retryDelayMs;
         private InputStream delegate;
 
-        private LazyFileStream(StreamContext ctx, String connection, String path, long offset) {
+        private LazyFileStream(StreamContext ctx, String connection, String path, long offset,
+                               int retries, long retryDelayMs) {
             this.ctx = ctx;
             this.connection = connection;
             this.path = path;
             this.offset = offset;
+            this.retries = retries;
+            this.retryDelayMs = retryDelayMs;
         }
 
         private InputStream delegate() throws IOException {
             if (delegate != null) {
                 return delegate;
             }
-            FileObject file;
-            try {
-                FileSystemHandler handler = Utils.getFileSystemHandler(connection);
-                file = handler.resolveFileWithSuspension(handler.getBaseDirectoryPath() + path);
-                if (!file.exists()) {
-                    throw new IOException("file not found on connection '" + connection + "': " + path);
-                }
-            } catch (IOException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new IOException("cannot open '" + path + "' on connection '" + connection + "'", e);
-            }
 
-            ctx.resources().register(NAME + ":file", file::close);
+            // The deployer's offset is where this source's output begins; the framework's resume offset
+            // is a position within that output. They add, and the result is a position in the file.
+            long resumeFrom = ctx.upstreamStartsAt();
+            long start = offset + resumeFrom;
 
-            // Identity is the connection name and the configured path, never a resolved URI: it is
-            // written into the run's workspace on a shared mount and printed when a guard mismatch is
-            // logged, so a URI carrying userinfo would publish credentials in both places.
-            ctx.job().sourceOpened(file.getContent().getSize(),
-                    file.getContent().getLastModifiedTime());
-
-            InputStream opened = file.getContent().getInputStream();
-            if (offset > 0L) {
-                long skipped = 0L;
-                while (skipped < offset) {
-                    long n = opened.skip(offset - skipped);
-                    if (n <= 0L) {
-                        throw new IOException("cannot skip to offset " + offset + " in '" + path
-                                + "': the file is only " + skipped + " bytes past the start");
-                    }
-                    skipped += n;
-                }
-            }
-            delegate = ctx.resources().register(NAME + ":stream", opened);
+            // Both registered before anything is opened, and in this order: the scope unwinds
+            // last-registered-first, so the stream closes before the handle it came from.
+            FileOpener opener = ctx.resources().register(NAME + ":file",
+                    new FileOpener(ctx, connection, path));
+            ResumableInputStream resumable = new ResumableInputStream(opener, path, start, retries,
+                    retryDelayMs, () -> ctx.job().isCancelled());
+            delegate = ctx.resources().register(NAME + ":stream", resumable);
             return delegate;
         }
 
@@ -312,6 +345,177 @@ public class StreamRead extends AbstractConnector implements StreamSource {
         @Override
         public void close() {
             // intentionally empty; see javadoc
+        }
+    }
+
+    /**
+     * Resolves the file and opens it at a byte offset, again whenever the connection drops.
+     *
+     * <p>Owns the VFS handle for the run. Each open releases the previous one — a reopen that kept it
+     * would hand the broken connection straight back — and the last is released when the run's resource
+     * scope unwinds.
+     *
+     * <h2>Seek where the provider can, skip where it cannot</h2>
+     * SFTP and local files expose {@link RandomAccessContent}, and its {@code seek} turns a start at
+     * byte N into a single positioned open: over SFTP that is {@code ChannelSftp.get(path, null, N)},
+     * and the bytes below N never cross the network. SMB2 exposes no random access at all, so it is
+     * skipped to instead.
+     *
+     * <p><b>Skipping is not automatically the expensive one.</b> VFS wraps a provider's stream in a
+     * {@code BufferedInputStream}, whose {@code skip} delegates downwards, and smbj's own skip moves a
+     * read offset without transferring anything — so SMB2 arrives about as cheaply as a seek, measured
+     * at 2 ms for 10 MB. A provider whose stream cannot do better will read and discard instead.
+     *
+     * <p>Which route was taken and <b>how long it took</b> are both logged whenever the start is not
+     * zero, because only the second one is a fact about this connection. A resume that is slow should
+     * be able to say so itself rather than be predicted here.
+     */
+    private static final class FileOpener implements ResumableInputStream.Opener, Closeable {
+
+        private static final Log log = LogFactory.getLog(FileOpener.class);
+
+        private final StreamContext ctx;
+        private final String connection;
+        private final String path;
+
+        private FileObject file;
+        private RandomAccessContent random;
+        private boolean reported;
+
+        private FileOpener(StreamContext ctx, String connection, String path) {
+            this.ctx = ctx;
+            this.connection = connection;
+            this.path = path;
+        }
+
+        @Override
+        public ResumableInputStream.Opened open(long from) throws IOException {
+
+            // Whatever a broken connection left behind, before asking for another one.
+            releaseQuietly();
+
+            FileObject opening;
+            try {
+                FileSystemHandler handler = Utils.getFileSystemHandler(connection);
+                opening = handler.resolveFileWithSuspension(handler.getBaseDirectoryPath() + path);
+                if (!opening.exists()) {
+                    throw new IOException("file not found on connection '" + connection + "': " + path);
+                }
+            } catch (IOException notThere) {
+                throw notThere;
+            } catch (Exception notReachable) {
+                throw new IOException("cannot open '" + path + "' on connection '" + connection + "'",
+                        notReachable);
+            }
+            file = opening;
+
+            long size = opening.getContent().getSize();
+            if (!reported) {
+                // Once per run, from the first open: this is the size the transfer is about, and a
+                // later open must not restate it.
+                ctx.job().sourceOpened(size, opening.getContent().getLastModifiedTime());
+                reported = true;
+            }
+
+            long began = System.currentTimeMillis();
+            InputStream in = from > 0L ? seekTo(opening, from) : null;
+            boolean seeked = in != null;
+            if (in == null) {
+                in = opening.getContent().getInputStream();
+                if (from > 0L) {
+                    skipTo(in, from);
+                }
+            }
+            if (from > 0L) {
+                // Timed rather than asserted. Whether getting here was free is a property of the
+                // provider and of its stream, and the two do not always agree: SMB2 offers no random
+                // access at all, yet its stream skips by moving a read offset, so it arrives as
+                // cheaply as a seek. A number settles that for whichever provider is in front of us;
+                // a sentence about it would eventually be wrong.
+                log.info(NAME + " opened '" + path + "' at byte " + from + " of " + size + " by "
+                        + (seeked ? "seeking" : "skipping") + ", in "
+                        + (System.currentTimeMillis() - began) + " ms");
+            }
+            return new ResumableInputStream.Opened(in, size);
+        }
+
+        /**
+         * A stream positioned at {@code from} without reading what comes before it, or {@code null}
+         * when this provider has no random access to offer.
+         *
+         * <p>Returning {@code null} rather than throwing is deliberate: there is a correct fallback,
+         * and a provider that cannot seek is a fact about the provider, not a failure of the transfer.
+         * A connection that is genuinely down fails the skip a moment later and reaches the retry
+         * budget the ordinary way.
+         */
+        private InputStream seekTo(FileObject opening, long from) {
+            RandomAccessContent content = null;
+            try {
+                content = opening.getContent().getRandomAccessContent(RandomAccessMode.READ);
+                content.seek(from);
+                InputStream in = content.getInputStream();
+                random = content;
+                return in;
+            } catch (Exception cannotSeek) {
+                if (content != null) {
+                    try {
+                        content.close();
+                    } catch (Exception ignore) {
+                        // nothing was promised; the handle below it is released either way
+                    }
+                }
+                log.debug("Random access to '" + path + "' on connection '" + connection + "' is not"
+                        + " available; reaching byte " + from + " by reading instead.", cannotSeek);
+                return null;
+            }
+        }
+
+        /**
+         * Reads and discards until {@code from}.
+         *
+         * <p>Throws rather than returning short. A source that quietly begins in the wrong place is the
+         * failure {@link StreamRead#seekable()} warns about: the sink skips nothing because the source promised
+         * to have skipped, and the destination ends up missing a slice from its middle.
+         */
+        private void skipTo(InputStream in, long from) throws IOException {
+            long remaining = from;
+            while (remaining > 0L) {
+                long moved = in.skip(remaining);
+                if (moved <= 0L) {
+                    if (in.read() < 0) {
+                        throw new EOFException("'" + path + "' is only " + (from - remaining)
+                                + " bytes long; it cannot be read from byte " + from);
+                    }
+                    moved = 1L;
+                }
+                remaining -= moved;
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            RandomAccessContent content = random;
+            FileObject open = file;
+            random = null;
+            file = null;
+            try {
+                if (content != null) {
+                    content.close();
+                }
+            } finally {
+                if (open != null) {
+                    open.close();
+                }
+            }
+        }
+
+        /** Release before a reopen: a handle that will not close must not stop the transfer resuming. */
+        private void releaseQuietly() {
+            try {
+                close();
+            } catch (Exception alreadyBroken) {
+                log.debug("Could not release the previous handle on '" + path + "'.", alreadyBroken);
+            }
         }
     }
 }

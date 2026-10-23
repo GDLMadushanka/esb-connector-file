@@ -49,6 +49,26 @@ public class SFTPConnectionConfig extends RemoteServerConfig {
     private boolean sftpPathFromRoot = false;
 
     /**
+     * Whether to skip the probe that works out if the server offers a shell.
+     *
+     * <p><b>Defaults to true, which is not the VFS default</b>, because the VFS default can hang the
+     * connection for ever. On construction the provider runs {@code id -u} over an exec channel to
+     * decide how to model POSIX permissions. A managed SFTP service -- SFTPCloud, AWS Transfer,
+     * Azure's SFTP endpoint, most appliances -- serves SFTP and nothing else: it accepts the channel
+     * and never answers, and the read that waits for the answer has no timeout. The connection does
+     * not fail, it stops, and a transfer waiting behind it stops with it.
+     *
+     * <p>What skipping it costs is small and local: VFS then assumes the connecting user owns what it
+     * reads, instead of comparing the file's uid against the one {@code id -u} would have returned.
+     * That is a client-side guess either way -- the server enforces the real permissions and rejects
+     * what is not allowed -- so the trade is a slightly more permissive pre-check against an
+     * unbounded hang.
+     *
+     * <p>Set it false for a server that does offer a shell and where the uid-based check is wanted.
+     */
+    private boolean disableDetectExecChannel = true;
+
+    /**
      * Create a SFTPConnectionConfig
      * with default values set
      */
@@ -134,6 +154,16 @@ public class SFTPConnectionConfig extends RemoteServerConfig {
     public void setSftpPathFromRoot(String sftpPathFromRoot) {
         if (StringUtils.isNotEmpty(sftpPathFromRoot)) {
             this.sftpPathFromRoot = Boolean.parseBoolean(sftpPathFromRoot);
+        }
+    }
+
+    public boolean isDisableDetectExecChannel() {
+        return disableDetectExecChannel;
+    }
+
+    public void setDisableDetectExecChannel(String disableDetectExecChannel) {
+        if (StringUtils.isNotEmpty(disableDetectExecChannel)) {
+            this.disableDetectExecChannel = Boolean.parseBoolean(disableDetectExecChannel);
         }
     }
 }

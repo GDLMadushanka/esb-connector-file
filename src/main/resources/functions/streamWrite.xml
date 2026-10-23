@@ -17,11 +17,23 @@
    under the License.
   -->
 <!--
-  Only valid inside a <streamPipeline>. See streamRead.xml. The binding is held for the whole of
+  Only valid inside a <streamSequence>. See streamRead.xml. The binding is held for the whole of
   consume(), because everything upstream of a sink executes inside it.
 -->
 <template xmlns="http://ws.apache.org/ns/synapse" name="streamWrite">
     <parameter name="path" description="Path to write to, relative to the connection's working directory"/>
+    <parameter isMandatory="false" name="writeBlock"
+               description="Size of one write block, which is this stage's unit of work. Defaults to
+                            8MB. 8MB suits local disk and a LAN share; a high-latency mount wants
+                            more."/>
+    <parameter isMandatory="false" name="writeBlockUnit"
+               description="Unit for writeBlock: B, KB, MB or GB. Defaults to B, so a bare writeBlock
+                            is a plain byte count."/>
+    <parameter isMandatory="false" name="checkpointFrequency"
+               description="Write blocks between checkpoints, default 1. At most this many blocks are
+                            re-written after a failure. The bytes go to a part file nothing can see
+                            until the transfer commits, so raising it costs only bandwidth on a
+                            resume and buys one fewer flush per block."/>
     <sequence>
         <class name="org.wso2.carbon.connector.operations.StreamWrite"/>
     </sequence>

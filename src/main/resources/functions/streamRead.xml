@@ -17,14 +17,44 @@
    under the License.
   -->
 <!--
-  Only valid inside a <streamPipeline>. The pipeline resolves this element to this template, takes the
+  Only valid inside a <streamSequence>. The pipeline resolves this element to this template, takes the
   StreamSource out of the class mediator below, and drives it directly — it does not mediate the
   template. The parameters are bound onto the message for the duration of the operator's open() call,
   which is the ordinary connector way and is why StreamRead reads them from the message.
+
+  A DROPPED CONNECTION DOES NOT END THE TRANSFER
+
+  A file large enough to be worth streaming is read through one stream for as long as the transfer
+  takes, which at these sizes is hours. On SFTP that is a single channel over a single TCP connection;
+  on SMB it is a session an idle timeout or a failover can end. When the connection goes, the file is
+  opened again at the byte the read had reached and the transfer carries on — no byte repeated, none
+  lost, and nothing downstream sees the gap.
+
+    readRetries      consecutive failures without progress tolerated. Defaults to 3; 0 turns the
+                     behaviour off. A successful read clears the count, so a link that drops once
+                     every 50 GB completes, while one that cannot move a byte fails after the budget
+                     rather than retrying for ever. When it is spent the failure is reported and the
+                     framework's own retry and resume take over.
+    readRetryDelay   pause in milliseconds before a retry, multiplied by the failure count — so the
+                     default 5000 waits 5s, then 10s, then 15s. A run stopped during the pause stops
+                     then, rather than waiting it out.
+
+  This survives a connection, not a crash: it is per attempt and a killed process loses it. Resume
+  across attempts is the framework's, from the sink's recorded position.
+
+  How a resume reaches byte N depends on the provider. SFTP and local files can seek, so the bytes
+  below N never cross the network; SMB2 cannot, so they are read and discarded. Which happened is
+  logged whenever the start is not zero, so a slow resume explains itself.
+
+  <offset> is the deployer's own "begin here", and it composes with a resume rather than competing
+  with it: the offset is where this source's output starts, and a resume is a position within that
+  output.
 -->
 <template xmlns="http://ws.apache.org/ns/synapse" name="streamRead">
     <parameter name="path" description="Path to the file to read, relative to the connection's working directory"/>
     <parameter name="offset" description="Byte offset to begin reading from. Defaults to 0"/>
+    <parameter name="readRetries" description="Consecutive read failures without progress tolerated before the transfer fails. Defaults to 3; 0 turns the behaviour off"/>
+    <parameter name="readRetryDelay" description="Pause in milliseconds before a read retry, multiplied by the failure count. Defaults to 5000"/>
     <sequence>
         <class name="org.wso2.carbon.connector.operations.StreamRead"/>
     </sequence>

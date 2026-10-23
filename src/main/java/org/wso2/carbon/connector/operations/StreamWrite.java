@@ -23,8 +23,10 @@ import org.wso2.org.apache.commons.vfs2.RandomAccessContent;
 import org.wso2.org.apache.commons.vfs2.util.RandomAccessMode;
 import org.apache.synapse.MessageContext;
 import org.apache.synapse.stream.StreamCommit;
-import org.apache.synapse.stream.CheckpointUnit;
 import org.apache.synapse.stream.StageArtifact;
+import org.apache.synapse.stream.StageDestination;
+import org.apache.synapse.stream.ByteSize;
+import org.apache.synapse.stream.CheckpointFrequency;
 import org.apache.synapse.stream.StreamContext;
 import org.apache.synapse.stream.StreamException;
 import org.apache.synapse.stream.StreamSink;
@@ -41,7 +43,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 
 /**
- * Tail of a stream pipeline: pulls the chain to completion and writes it to a file.
+ * Tail of a stream sequence: pulls the chain to completion and writes it to a file.
  *
  * <pre>
  *   &lt;file.streamWrite configKey="conn1"&gt;
@@ -50,14 +52,14 @@ import java.io.OutputStream;
  * </pre>
  *
  * <p>This is the only operator in the chain that reads, so the entire transfer happens inside
- * {@link #consume}. The pipeline holds this operation's parameters bound for that whole call, unlike a
+ * {@link #consume}. The sequence holds this operation's parameters bound for that whole call, unlike a
  * source or transform where they are bound only for the build.
  *
  * <h2>Writes to a temporary name and renames on success</h2>
  * A partial file sitting at the destination is the worst available outcome: it looks complete, so a
  * later run reads it as complete and nothing reports a problem. So the output goes to
  * {@code <path>.part} and is moved into place only when the run succeeded — {@link StreamCommit}'s
- * {@code close()} publishes, {@code abort()} discards, and the pipeline calls one or the other
+ * {@code close()} publishes, {@code abort()} discards, and the sequence calls one or the other
  * depending on the outcome.
  */
 public class StreamWrite extends AbstractConnector implements StreamSink {
@@ -85,13 +87,17 @@ public class StreamWrite extends AbstractConnector implements StreamSink {
      *
      * <p>Trivial here because the checkpoint is already counted in bytes — a sink that records blocks
      * or records would have to convert. Returns the <b>reconciled</b> position, not the raw
-     * checkpoint: see {@link #resumeAt}.
+     * checkpoint: see {@link StageArtifact#resumeAgainst}, which is asked not to discard here --
+     * this is a question about where the run will start, asked before it has started, and answering
+     * it must not cut the part file as a side effect.
      */
     @Override
     public long durableByteOffset(StreamContext ctx) throws IOException {
         try {
             Resolved resolved = resolve(ctx);
-            return resumeAt(ctx.artifact(CheckpointUnit.BYTES, FORMAT_VERSION), resolved.part, false);
+            long blockBytes = blockBytes(ctx);
+            return ctx.artifact("blocks", FORMAT_VERSION, checkpointFrequency(ctx))
+                    .resumeAgainst(new PartFile(resolved.part, blockBytes), false) * blockBytes;
         } catch (StreamException cannotSay) {
             return -1L;
         }
@@ -102,27 +108,28 @@ public class StreamWrite extends AbstractConnector implements StreamSink {
 
     private static final int BUFFER_BYTES = 64 * 1024;
 
-    /**
-     * How often to report cumulative progress to the job, in bytes.
-     *
-     * <p>Coarse on purpose. {@code JobContext.progress} is a database update behind a live view and its
-     * contract says callers must rate-limit, so this is a display cadence and nothing else.
-     */
-    private static final long PROGRESS_INTERVAL_BYTES = 8L * 1024 * 1024;
 
     /**
-     * How often to offer the framework a position, in bytes.
+     * Default size of a write block, which is this stage's unit of work.
      *
-     * <p><b>Not the checkpoint cadence.</b> {@code unitDone} is a report; the framework decides whether
-     * a checkpoint is due from the deployer's {@code checkpointEvery}, so reporting more finely than
-     * that costs only the {@code flush()} below and never an extra fsync. What this number does set is
-     * the <b>floor</b> on what a deployer can ask for: no {@code checkpointEvery} finer than this can
-     * be honoured, which is why it is well below the default rather than equal to it.
-     *
-     * <p>1 MiB rather than the 64 KiB buffer because the flush is the cost, and over SFTP or SMB it may
-     * be a round trip rather than a push into the page cache.
+     * <p>Checkpoint positions count blocks, and {@code checkpointFrequency} counts blocks, so this is
+     * what makes that number mean something a deployer chose. 8 MiB suits local disk and a LAN share;
+     * a high-latency mount wants more, which is why it is configurable at all.
      */
-    private static final long CHECKPOINT_REPORT_BYTES = 1024L * 1024;
+    private static final long DEFAULT_WRITE_BLOCK_BYTES = 8L * 1024 * 1024;
+
+    /**
+     * One block per checkpoint when the deployer says nothing.
+     *
+     * <p>Coarser than it looks: a block is 8 MiB by default, so this is an fsync per 8 MiB and not
+     * per byte. And a reprocessed block here costs only bandwidth — the bytes go into a part file
+     * nothing outside the run can see (invariant 5), and resume overwrites the same offsets — so
+     * raising it trades re-moved bytes for throughput and never a repeated side effect.
+     *
+     * <p>{@code writeBlock} sizes the unit and this counts them. Both are parameters of this
+     * operation, in the same form, because a deployer sizing the window needs both halves.
+     */
+    private static final int DEFAULT_CHECKPOINT_FREQUENCY = 1;
 
     /**
      * Versions the meaning of this stage's checkpoint. The position is a byte count into the part
@@ -132,7 +139,7 @@ public class StreamWrite extends AbstractConnector implements StreamSink {
 
     @Override
     public void connect(MessageContext messageContext) throws ConnectException {
-        throw new ConnectException(NAME + " is only valid inside a <streamPipeline>. It consumes a lazy"
+        throw new ConnectException(NAME + " is only valid inside a <streamSequence>. It consumes a lazy"
                 + " chain rather than mediating a message, so there is nothing for it to do in a"
                 + " sequence. Use file.write instead.");
     }
@@ -153,8 +160,9 @@ public class StreamWrite extends AbstractConnector implements StreamSink {
         ctx.resources().register(NAME + ":target", target::close);
         ctx.resources().register(NAME + ":part", part::close);
 
-        StageArtifact checkpoint = ctx.artifact(CheckpointUnit.BYTES, FORMAT_VERSION);
-        long resumeFrom = resumeAt(checkpoint, part, true);
+        long blockBytes = blockBytes(ctx);
+        StageArtifact checkpoint = ctx.artifact("blocks", FORMAT_VERSION, checkpointFrequency(ctx));
+        long resumeFrom = checkpoint.resumeAgainst(new PartFile(part, blockBytes), true) * blockBytes;
 
         // Skip only what the source did not already skip. Both ends read upstreamStartsAt(), so this
         // is zero when the framework started a seekable source at our resume point, and the whole
@@ -190,24 +198,29 @@ public class StreamWrite extends AbstractConnector implements StreamSink {
             sinceProgress += read;
             sinceReport += read;
 
-            if (sinceProgress >= PROGRESS_INTERVAL_BYTES) {
+            if (sinceProgress >= blockBytes) {
                 sinceProgress = 0L;
                 // Records are not knowable here: a sink sees a byte chain, not a structure.
                 ctx.job().progress(ctx.stageName(), written, 0L);
             }
 
-            if (sinceReport >= CHECKPOINT_REPORT_BYTES) {
+            // One report per completed block. The framework applies checkpointFrequency on
+            // top, so a deployer asking for every fourth block gets exactly that.
+            if (sinceReport >= blockBytes) {
                 sinceReport = 0L;
 
                 // The ordering contract, and the operator's half of it: the bytes are pushed out
                 // before the position moves. flush() is not fsync — VFS exposes no sync, and over
                 // SFTP or SMB there is nothing local to sync — so a machine crash can still leave the
-                // checkpoint ahead of what survived. That is what the reconciliation in resumeAt is
-                // for, and it is weaker than the framework's own artifact handling, which does fsync.
+                // checkpoint ahead of what survived. That is what resumeAgainst reconciles on the
+                // next attempt, and it is weaker than the framework's own artifact handling, which
+                // does fsync.
                 // A process kill, which is what a resume test does, is fully covered: the page cache
                 // outlives the process.
                 out.flush();
-                checkpoint.unitDone(written);
+                checkpoint.unitDone(written / blockBytes);
+                // Same number the checkpoint took, so a watcher and a resume agree (ADR-0069).
+                ctx.status("written " + (written / blockBytes) + " blocks (" + written + " bytes)");
             }
 
             // Checked every buffer, NOT every checkpoint interval. These were one branch, which tied
@@ -236,6 +249,30 @@ public class StreamWrite extends AbstractConnector implements StreamSink {
             this.part = part;
             this.path = path;
         }
+    }
+
+    /** The deployer's cadence, in blocks of {@link #blockBytes}. See {@link CheckpointFrequency}. */
+    private static int checkpointFrequency(StreamContext ctx) throws StreamException {
+        MessageContext msg = ctx.message();
+        Object value = msg == null ? null
+                : ConnectorUtils.lookupTemplateParamater(msg, CheckpointFrequency.PARAMETER);
+        return CheckpointFrequency.of(value == null ? null : value.toString(),
+                DEFAULT_CHECKPOINT_FREQUENCY, NAME);
+    }
+
+    /**
+     * This stage's unit of work, in bytes, from the {@code writeBlock} parameter.
+     *
+     * <p>Checkpoint positions count these, and so does {@code checkpointFrequency}, so the number a
+     * deployer sets is a number of blocks they also chose the size of.
+     */
+    private static long blockBytes(StreamContext ctx) throws StreamException {
+        MessageContext msg = ctx.message();
+        Object amount = msg == null ? null : ConnectorUtils.lookupTemplateParamater(msg, "writeBlock");
+        Object unit = msg == null ? null : ConnectorUtils.lookupTemplateParamater(msg, "writeBlockUnit");
+        Long bytes = ByteSize.bytes(amount == null ? null : amount.toString(),
+                unit == null ? null : unit.toString(), NAME, "writeBlock");
+        return bytes == null ? DEFAULT_WRITE_BLOCK_BYTES : bytes;
     }
 
     private Resolved resolve(StreamContext ctx) throws StreamException {
@@ -272,54 +309,46 @@ public class StreamWrite extends AbstractConnector implements StreamSink {
     }
 
     /**
-     * The byte this attempt resumes at, reconciled against what is actually on disk.
+     * The part file, as the framework's reconciliation sees it.
      *
-     * <p>This is the {@code L <= A} rule the framework applies to its own artifacts, done here because
-     * the part file is this operator's, not the framework's. {@code L} is the length the checkpoint
-     * claims; {@code A} is what the part file really holds.
+     * <p>Two questions and no judgement: how big is it, and cut it to this. Which of the two numbers
+     * wins, and whether cutting happens at all, is {@link StageArtifact#resumeAgainst}'s to decide —
+     * this sink used to decide it, and so did the Azure one, in two copies of the same argument.
      *
-     * <ul>
-     *   <li><b>L &lt;= A</b> — the ordinary case. Accept the checkpoint and cut the file back to it:
-     *       the bytes above were written but never recorded, so whatever produced them is about to
-     *       produce them again, and leaving them would duplicate a stretch of the output.</li>
-     *   <li><b>L &gt; A</b> — the checkpoint describes bytes that are not there, which only storage
-     *       that acknowledged a write it did not keep can produce. The file wins; resume from A.</li>
-     * </ul>
-     *
-     * <p>Its limit, stated plainly because it is the same one the framework documents: this compares
-     * <i>lengths</i>. A file of the right length with an unwritten gap below it passes, and only a
-     * checksum would catch that. {@code checkpointEvery} bounds how much such a gap could cost —
-     * this stage counts in bytes, so that is its cadence attribute and not {@code maxReprocessed},
-     * which would be a count of units here and is ignored (ADR-0056).
-     *
-     * @param truncate false to answer without touching the file, for {@code durableByteOffset}
+     * <p>Built per run from the resolved part file, never held in a field: one operator instance
+     * serves concurrent runs.
      */
-    private long resumeAt(StageArtifact checkpoint, FileObject part, boolean truncate)
-            throws IOException {
-        long claimed = checkpoint.resumePosition();
-        if (claimed <= 0) {
-            return 0L;
+    private static final class PartFile implements StageDestination {
+
+        private final FileObject part;
+        private final long blockBytes;
+
+        private PartFile(FileObject part, long blockBytes) {
+            this.part = part;
+            this.blockBytes = blockBytes;
         }
-        long actual;
-        try {
-            actual = part.exists() ? part.getContent().getSize() : 0L;
-        } catch (FileSystemException unreadable) {
-            throw new IOException("cannot size the part file to resume against", unreadable);
+
+        @Override
+        public long durablePosition() throws IOException {
+            try {
+                // In blocks, because that is the unit the checkpoint counts. A trailing partial block
+                // is not durable work: resume rewrites it from the start of the block.
+                return part.exists() ? part.getContent().getSize() / blockBytes : 0L;
+            } catch (FileSystemException unreadable) {
+                // Not zero. Zero means "it holds nothing", which would re-send the whole file; an
+                // unreadable part file is a different thing and the caller must hear about it.
+                throw new IOException("cannot size the part file to resume against", unreadable);
+            }
         }
-        if (claimed > actual) {
-            log.warn(NAME + " checkpoint claims " + claimed + " bytes but the part file holds "
-                    + actual + "; the checkpoint is ahead of the data, so resuming at " + actual);
-            return actual;
-        }
-        if (truncate && actual > claimed) {
+
+        @Override
+        public void discardAbove(long position) throws IOException {
+            long truncateTo = position * blockBytes;
             try (RandomAccessContent raf =
                          part.getContent().getRandomAccessContent(RandomAccessMode.READWRITE)) {
-                raf.setLength(claimed);
+                raf.setLength(truncateTo);
             }
-            log.info(NAME + " cut the part file from " + actual + " back to the recorded " + claimed
-                    + " bytes; everything above was written but never checkpointed");
         }
-        return claimed;
     }
 
     /** Discards a prefix the source could not skip itself. */

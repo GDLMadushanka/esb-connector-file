@@ -47,6 +47,13 @@ public class SFTPFileSystemSetup implements ProtocolBasedFileSystemSetup {
             sftpConfigBuilder.setSessionTimeout(fso,
                 Duration.ofMillis(sftpConnectionConfig.getSessionTimeout()));
             sftpConfigBuilder.setUserDirIsRoot(fso, sftpConnectionConfig.isUserDirIsRoot());
+
+            // Skip the "does this server have a shell" probe unless asked for it. On an SFTP-only
+            // server the probe never returns and the connection hangs rather than failing -- see
+            // SFTPConnectionConfig#disableDetectExecChannel for what the probe is and what skipping
+            // it costs.
+            sftpConfigBuilder.setDisableDetectExecChannel(fso,
+                sftpConnectionConfig.isDisableDetectExecChannel());
             
             // Set SFTP path from root if enabled (overrides userDirIsRoot for absolute path access)
             if (sftpConnectionConfig.isSftpPathFromRoot()) {

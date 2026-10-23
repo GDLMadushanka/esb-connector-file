@@ -1,0 +1,101 @@
+{
+    "connectorName": "file",
+    "operationName": "streamWrite",
+    "title": "Stream Write",
+    "help": "<h1>Stream Write</h1> <b>Writes a byte chain to a file. Only valid as the sink of a streamSequence &mdash; it reads the chain to completion rather than mediating a message, so it cannot be used in an ordinary sequence. Use Write for that. The write goes to a part file and is renamed into place only when the transfer succeeds, so a failed run publishes nothing.</b>",
+    "elements": [
+        {
+            "type": "attributeGroup",
+            "value": {
+                "groupName": "General",
+                "elements": [
+                    {
+                        "type": "attribute",
+                        "value": {
+                            "name": "configRef",
+                            "displayName": "Connection",
+                            "inputType": "connection",
+                            "allowedConnectionTypes": [
+                                "LOCAL",
+                                "FTP",
+                                "FTPS",
+                                "SFTP",
+                                "SMB2"
+                            ],
+                            "defaultType": "connection.local",
+                            "defaultValue": "",
+                            "required": "true",
+                            "helpTip": "Connection to be used"
+                        }
+                    },
+                    {
+                        "type": "attributeGroup",
+                        "value": {
+                            "groupName": "Basic",
+                            "elements": [
+                                {
+                                    "type": "attribute",
+                                    "value": {
+                                        "name": "path",
+                                        "displayName": "File Path",
+                                        "inputType": "stringOrExpression",
+                                        "defaultValue": "",
+                                        "required": "true",
+                                        "helpTip": "Path to write to, relative to the connection's working directory."
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "type": "attributeGroup",
+                        "value": {
+                            "groupName": "Advanced",
+                            "elements": [
+                                {
+                                    "type": "attribute",
+                                    "value": {
+                                        "name": "writeBlock",
+                                        "displayName": "Write Block Size",
+                                        "inputType": "integerOrExpression",
+                                        "defaultValue": "8",
+                                        "required": "false",
+                                        "helpTip": "Size of one write block, which is this stage's unit of work and what the checkpoint counts. 8MB suits local disk and a LAN share; a high-latency mount such as SMB or SFTP over a WAN wants more. The number only — choose the unit below."
+                                    }
+                                },
+                                {
+                                    "type": "attribute",
+                                    "value": {
+                                        "name": "writeBlockUnit",
+                                        "displayName": "Write Block Size Unit",
+                                        "inputType": "comboOrExpression",
+                                        "defaultValue": "MB",
+                                        "required": "false",
+                                        "comboValues": [
+                                            "B",
+                                            "KB",
+                                            "MB",
+                                            "GB"
+                                        ],
+                                        "helpTip": "Unit for Write Block Size. KB, MB and GB are binary (1024-based)."
+                                    }
+                                },
+                                {
+                                    "type": "attribute",
+                                    "value": {
+                                        "name": "checkpointFrequency",
+                                        "displayName": "Checkpoint Frequency",
+                                        "inputType": "integerOrExpression",
+                                        "defaultValue": "1",
+                                        "required": "false",
+                                        "helpTip": "Number of write blocks between checkpoints. At most this many blocks are re-written after a failure. The bytes go to a part file nothing outside the transfer can see, and a resume overwrites the same offsets, so raising this costs only bandwidth on a resume — never a repeated side effect — and buys one fewer flush per block."
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+    ]
+}
